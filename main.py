@@ -2,156 +2,338 @@ from fastapi import FastAPI, Request
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 import requests
+from bs4 import BeautifulSoup
 import pandas as pd
 import random
 from datetime import datetime, timezone, timedelta
 import urllib3
 import os
 import uvicorn
+from itertools import combinations
+from collections import Counter
 
-# 1. 停用 Python 的 SSL 警告 (強行突破台彩憑證)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 2. 終極防呆：檢查是否有 templates 資料夾，沒有就自動建立並塞入警告檔，防止 502 當機
+# ==========================================
+# UI 介面：100% 完整對齊下一期預測策略
+# ==========================================
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>賓果賓果 下一期預測中心</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white font-sans p-6 min-h-screen">
+    <div class="max-w-6xl mx-auto">
+        <div class="flex flex-col md:flex-row justify-between items-end border-b border-gray-700 pb-4 mb-6">
+            <div>
+                <h1 class="text-3xl font-bold text-yellow-400 mb-2">🎰 賓果賓果 終極下一期預測</h1>
+                <p class="text-gray-400">當前最新期數：<span class="text-white font-bold">{{ data.last_draw_no }}</span> | 已分析近 100 期數據</p>
+            </div>
+            <div class="text-right mt-4 md:mt-0">
+                <p class="text-sm text-gray-400">最後運算 (每5分自動刷新)</p>
+                <p class="text-xl font-mono text-green-400">{{ data.update_time }}</p>
+            </div>
+        </div>
+
+        <h2 class="text-xl font-bold mb-4 text-blue-300">📊 當下盤勢狀態 (Next Draw 預測基底)</h2>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+            <div class="bg-gray-800 p-4 rounded-lg border border-red-900">
+                <h3 class="text-red-400 font-bold mb-2">🔥 熱門號 (高頻率)</h3>
+                <div class="flex flex-wrap gap-1">
+                    {% for num in data.hot_numbers %}
+                    <span class="bg-red-600 text-white px-2 py-1 rounded text-xs font-bold">{{ num }}</span>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded-lg border border-blue-900">
+                <h3 class="text-blue-400 font-bold mb-2">❄️ 真冷門號 (>10期未開)</h3>
+                <div class="flex flex-wrap gap-1">
+                    {% for num in data.cold_numbers %}
+                    <span class="bg-blue-600 text-white px-2 py-1 rounded text-xs font-bold">{{ num }}</span>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded-lg border border-purple-900">
+                <h3 class="text-purple-400 font-bold mb-2">⏭️ 跳期號 (跳1或2期)</h3>
+                <div class="flex flex-wrap gap-1">
+                    {% for num in data.skip_numbers %}
+                    <span class="bg-purple-600 text-white px-2 py-1 rounded text-xs font-bold">{{ num }}</span>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded-lg border border-yellow-700">
+                <h3 class="text-yellow-400 font-bold mb-2">📈 當前熱門尾數</h3>
+                <div class="flex flex-wrap gap-2 text-xl font-black text-yellow-500">
+                    {% for tail in data.hot_tails %}<span>{{ tail }}尾</span>{% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <h2 class="text-2xl font-bold mb-4 text-pink-400">🚀 下一期最強預測 (條件完全符合且歷史機率最高)</h2>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            <!-- 2星預測區 -->
+            <div class="bg-gray-800 p-5 rounded-xl border border-pink-900 shadow-lg">
+                <h3 class="text-xl text-pink-300 font-bold mb-4">✌️ 下一期 2 星推薦</h3>
+                
+                <div class="mb-1 text-sm text-gray-400 font-bold mt-4">🔹 【短線連莊】上一期號碼 + 熱門號</div>
+                <div class="space-y-2">
+                    {% for item in data.pred_2_repeat %}
+                    <div class="flex items-center justify-between bg-gray-700 p-2 rounded-lg border-l-4 border-pink-500">
+                        <div class="flex space-x-2">
+                            {% for num in item.combo %}
+                            <div class="w-10 h-10 rounded-full bg-pink-600 flex items-center justify-center text-white text-lg font-bold">{{ num }}</div>
+                            {% endfor %}
+                        </div>
+                        <div class="text-xs text-gray-400">歷史勝率評分: <span class="text-white font-bold">{{ item.score }}</span></div>
+                    </div>
+                    {% endfor %}
+                </div>
+                
+                <div class="mb-1 text-sm text-gray-400 font-bold mt-4">🔹 【相鄰連號】連續相鄰號碼 (n, n+1)</div>
+                <div class="space-y-2">
+                    {% for item in data.pred_2_adjacent %}
+                    <div class="flex items-center justify-between bg-gray-700 p-2 rounded-lg border-l-4 border-purple-500">
+                        <div class="flex space-x-2">
+                            {% for num in item.combo %}
+                            <div class="w-10 h-10 rounded-full bg-purple-600 flex items-center justify-center text-white text-lg font-bold">{{ num }}</div>
+                            {% endfor %}
+                        </div>
+                        <div class="text-xs text-gray-400">歷史勝率評分: <span class="text-white font-bold">{{ item.score }}</span></div>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                <div class="mb-1 text-sm text-gray-400 font-bold mt-4">🔹 【冷熱交替】真冷門號 (>10期) + 熱門號</div>
+                <div class="space-y-2">
+                    {% for item in data.pred_2_coldhot %}
+                    <div class="flex items-center justify-between bg-gray-700 p-2 rounded-lg border-l-4 border-blue-500">
+                        <div class="flex space-x-2">
+                            {% for num in item.combo %}
+                            <div class="w-10 h-10 rounded-full bg-blue-600 flex items-center justify-center text-white text-lg font-bold">{{ num }}</div>
+                            {% endfor %}
+                        </div>
+                        <div class="text-xs text-gray-400">歷史勝率評分: <span class="text-white font-bold">{{ item.score }}</span></div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <!-- 3星預測區 -->
+            <div class="bg-gray-800 p-5 rounded-xl border border-yellow-700 shadow-lg">
+                <h3 class="text-xl text-yellow-300 font-bold mb-4">🎯 下一期 3 星推薦</h3>
+                
+                <div class="mb-1 text-sm text-gray-400 font-bold">🔸 【對稱+趨勢】1-26,27-52,53-80各一 + 尾數/倍數</div>
+                <div class="space-y-2">
+                    {% for item in data.pred_3_zone %}
+                    <div class="flex items-center justify-between bg-gray-700 p-2 rounded-lg border-l-4 border-yellow-500">
+                        <div class="flex space-x-2">
+                            {% for num in item.combo %}
+                            <div class="w-10 h-10 rounded-full bg-yellow-500 flex items-center justify-center text-black text-lg font-bold">{{ num }}</div>
+                            {% endfor %}
+                        </div>
+                        <div class="text-xs text-gray-400">歷史勝率評分: <span class="text-white font-bold">{{ item.score }}</span></div>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                <div class="mb-1 text-sm text-gray-400 font-bold mt-4">🔸 【跳期規律】跳1或2期號碼 + 熱門號</div>
+                <div class="space-y-2">
+                    {% for item in data.pred_3_skip %}
+                    <div class="flex items-center justify-between bg-gray-700 p-2 rounded-lg border-l-4 border-orange-500">
+                        <div class="flex space-x-2">
+                            {% for num in item.combo %}
+                            <div class="w-10 h-10 rounded-full bg-orange-500 flex items-center justify-center text-white text-lg font-bold">{{ num }}</div>
+                            {% endfor %}
+                        </div>
+                        <div class="text-xs text-gray-400">歷史勝率評分: <span class="text-white font-bold">{{ item.score }}</span></div>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                <div class="mb-1 text-sm text-gray-400 font-bold mt-4">🔸 【四區分散】(1-20,21-40,41-60,61-80) 選三區分散風險</div>
+                <div class="space-y-2">
+                    {% for item in data.pred_3_scatter %}
+                    <div class="flex items-center justify-between bg-gray-700 p-2 rounded-lg border-l-4 border-green-500">
+                        <div class="flex space-x-2">
+                            {% for num in item.combo %}
+                            <div class="w-10 h-10 rounded-full bg-green-600 flex items-center justify-center text-white text-lg font-bold">{{ num }}</div>
+                            {% endfor %}
+                        </div>
+                        <div class="text-xs text-gray-400">歷史勝率評分: <span class="text-white font-bold">{{ item.score }}</span></div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>setTimeout(function() { window.location.reload(); }, 300000);</script>
+</body>
+</html>
+"""
+
 if not os.path.exists("templates"):
     os.makedirs("templates")
-    with open("templates/index.html", "w", encoding="utf-8") as f:
-        f.write("<h1 style='color:red;'>系統已成功啟動！<br>但你忘記把 index.html 放入 templates 資料夾中了，請回 GitHub 檢查！</h1>")
+with open("templates/index.html", "w", encoding="utf-8") as f:
+    f.write(HTML_CONTENT)
+
+# ==========================================
+# 核心邏輯演算法
+# ==========================================
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-class BingoAnalyzer:
+class UltimateBingoPredictor:
     def __init__(self):
-        self.draws =[] 
-        self.current_date = ""
-
-    def fetch_today_data(self):
-        # 3. 強制設定為台灣時區 (UTC+8)，避免雲端主機時間錯亂
-        tz_tw = timezone(timedelta(hours=8))
-        now = datetime.now(tz_tw)
-        today_str = now.strftime("%Y-%m-%d")
-        
-        if self.current_date != today_str:
-            self.draws =[]
-            self.current_date = today_str
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-        }
-        
-        url = f"https://api.taiwanlottery.com/TLCAPIWeB/Lottery/BingoResult?date={today_str}"
-        try:
-            # 關鍵修復：加入 verify=False 繞過憑證驗證
-            response = requests.get(url, headers=headers, timeout=10, verify=False)
-            
-            if response.status_code == 200:
-                data = response.json()
-                # 嘗試解析台彩 API 真實資料
-                if "content" in data and "bingoResult" in data["content"]:
-                    real_draws = []
-                    for item in data["content"]["bingoResult"]:
-                        # 嘗試抓取號碼欄位
-                        nums_str = item.get("drawNumberSize", item.get("drawNumber", ""))
-                        if nums_str:
-                            nums = sorted([int(x) for x in nums_str.split(",") if x.isdigit()])
-                            real_draws.append({
-                                "draw_no": str(item.get("drawTerm", "未知")),
-                                "numbers": nums
-                            })
-                    if real_draws:
-                        # API 回傳通常是從新到舊，我們將其反轉為從舊到新
-                        self.draws = list(reversed(real_draws))
-                        return # 成功抓到資料，提早結束
-        except Exception as e:
-            print(f"真實數據抓取失敗，啟動備用機制: {e}")
-            
-        # 備用機制 (只在台彩完全當機或阻擋時執行)
-        self._generate_mock_today_data(now)
-
-    def _generate_mock_today_data(self, now):
         self.draws =[]
-        # 以台灣時間早上 7:05 為基準點
-        start_time = now.replace(hour=7, minute=5, second=0, microsecond=0)
-        draw_count = int((now - start_time).total_seconds() / 300)
-        
-        # 確保期數合理 (避免半夜執行時變負數)
-        if draw_count < 1: draw_count = 1
-        if draw_count > 200: draw_count = 200
-        
-        for i in range(draw_count):
-            nums = random.sample(range(1, 81), 20)
-            self.draws.append({
-                "draw_no": f"模擬期數-{i+1:03d}",
-                "numbers": sorted(nums)
-            })
+
+    def fetch_auzo_data(self):
+        url = "https://lotto.auzo.tw/bingobingo.php"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        try:
+            response = requests.get(url, headers=headers, timeout=10, verify=False)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            new_draws =[]
+            for tr in soup.find_all('tr'):
+                nums, draw_no =[], ""
+                for text_node in tr.stripped_strings:
+                    if text_node.isdigit():
+                        val = int(text_node)
+                        if len(text_node) >= 8 and text_node.startswith('11'):
+                            draw_no = text_node
+                        elif 1 <= val <= 80:
+                            nums.append(val)
+                nums = sorted(list(set(nums)))
+                if draw_no and len(nums) >= 20:
+                    new_draws.append({"draw_no": draw_no, "numbers": nums[:20]})
+            
+            if new_draws:
+                self.draws = list(reversed(new_draws)) # 舊到新
+                return
+        except Exception:
+            pass
+        if not self.draws:
+            self._generate_mock_data()
+
+    def _generate_mock_data(self):
+        self.draws =[]
+        for i in range(100):
+            self.draws.append({"draw_no": f"模擬{i:03d}", "numbers": sorted(random.sample(range(1, 81), 20))})
 
     def analyze(self):
-        self.fetch_today_data()
+        self.fetch_auzo_data()
         
-        all_nums =[]
-        for d in self.draws:
+        # 抓取近期 100 期數據
+        recent_draws = self.draws[-100:] if len(self.draws) > 100 else self.draws
+        
+        all_nums, tails = [],[]
+        for d in recent_draws:
             all_nums.extend(d['numbers'])
+            tails.extend([n % 10 for n in d['numbers']])
             
-        # 統計熱門與冷門
+        # 1. 盤勢計算
         freq = pd.Series(all_nums).value_counts()
         hot_numbers = freq.head(15).index.tolist() if not freq.empty else list(range(1, 16))
         
+        # 計算遺漏值 (Gap)
         last_seen = {i: -1 for i in range(1, 81)}
-        for idx, d in enumerate(self.draws):
-            for n in d['numbers']:
-                last_seen[n] = idx
-                
-        current_idx = len(self.draws) - 1
+        for idx, d in enumerate(recent_draws):
+            for n in d['numbers']: last_seen[n] = idx
+        current_idx = len(recent_draws) - 1
         gaps = {n: current_idx - last_seen[n] for n in range(1, 81)}
-        cold_numbers = sorted(gaps, key=gaps.get, reverse=True)[:15]
         
-        # 連號觀察
-        last_draw_nums = self.draws[-1]['numbers'] if self.draws else random.sample(range(1, 81), 20)
-        neighbors = set()
-        for n in last_draw_nums:
-            if n + 1 <= 80: neighbors.add(n + 1)
-            if n - 1 >= 1: neighbors.add(n - 1)
-        neighbors = list(neighbors - set(last_draw_nums))
-        if not neighbors: neighbors = list(range(20, 30))
+        # 規則：冷門號 (連續 >10 期未開)
+        cold_numbers =[n for n, g in gaps.items() if g >= 10]
+        if not cold_numbers: cold_numbers = sorted(gaps, key=gaps.get, reverse=True)[:10]
 
-        # 三星組合邏輯
-        def is_valid_oddeven(combo):
-            odds = sum(1 for x in combo if x % 2 != 0)
-            return odds in [1, 2]
+        # 規則：跳期號 (跳一期 gap==1 或 隔兩期 gap==2)
+        skip_numbers = [n for n, g in gaps.items() if g in [1, 2]]
 
-        def get_samsung_combo(pool_a, pool_b, pool_c):
-            for _ in range(100):
-                c =[random.choice(pool_a), random.choice(pool_b), random.choice(pool_c)]
-                if len(set(c)) == 3 and is_valid_oddeven(c):
-                    return sorted(c)
-            return sorted(list(set([pool_a[0], pool_b[0], pool_c[0]] + [1,2,3]))[:3])
+        # 連莊號 (上一期)
+        last_draw_nums = recent_draws[-1]['numbers'] if recent_draws else[]
+        
+        # 熱門尾數
+        hot_tails = pd.Series(tails).value_counts().head(3).index.tolist()
 
-        recs =[
-            {"type": "攻擊型", "name": "🔥 追熱 + 連號組合", "desc": "選出 2個熱門號 + 1個上一期鄰近號", "combo": get_samsung_combo(hot_numbers[:10], hot_numbers[:10], neighbors)},
-            {"type": "防守型", "name": "⚖️ 冷熱平衡組合", "desc": "選出 1個熱門號 + 1個冷門號 + 1個隨機互補號", "combo": get_samsung_combo(hot_numbers[:10], cold_numbers[:10], list(range(1, 81)))},
-            {"type": "趨勢型", "name": "🔁 雙倍重複連開", "desc": "直接重押 1個上一期號碼 + 1個鄰近號 + 1個熱門號", "combo": get_samsung_combo(last_draw_nums, neighbors, hot_numbers[:10])}
-        ]
+        # 計算歷史 2星/3星 出現次數作為勝率評分依據
+        pairs, triplets = [],[]
+        for d in recent_draws:
+            pairs.extend(combinations(d['numbers'], 2))
+            triplets.extend(combinations(d['numbers'], 3))
+        pair_counts = Counter(pairs)
+        triplet_counts = Counter(triplets)
+
+        # ==========================================
+        # 🚀 下一期預測邏輯 (嚴格條件過濾 + 歷史勝率排序)
+        # ==========================================
+        
+        # 【2星】短線連莊：上一期 + 熱門號
+        pred_2_repeat_dict = {k: v for k, v in pair_counts.items() if (k[0] in last_draw_nums and k[1] in hot_numbers) or (k[1] in last_draw_nums and k[0] in hot_numbers)}
+        pred_2_repeat =[{"combo": list(k), "score": v} for k, v in Counter(pred_2_repeat_dict).most_common(2)]
+
+        # 【2星】相鄰連號：連續相鄰 (n, n+1)
+        pred_2_adj_dict = {k: v for k, v in pair_counts.items() if k[1] == k[0] + 1}
+        pred_2_adjacent =[{"combo": list(k), "score": v} for k, v in Counter(pred_2_adj_dict).most_common(2)]
+
+        # 【2星】冷熱交替：真冷門 + 熱門號
+        pred_2_ch_dict = {k: v for k, v in pair_counts.items() if (k[0] in cold_numbers and k[1] in hot_numbers) or (k[1] in cold_numbers and k[0] in hot_numbers)}
+        pred_2_coldhot =[{"combo": list(k), "score": v} for k, v in Counter(pred_2_ch_dict).most_common(2)]
+
+        # 【3星】對稱+趨勢：1-26,27-52,53-80 各一 + 包含尾數與倍數
+        def is_sym_trend(c):
+            h_zone = any(1<=x<=26 for x in c) and any(27<=x<=52 for x in c) and any(53<=x<=80 for x in c)
+            h_tail = any(x%10 in hot_tails for x in c)
+            h_mult = any(x%5==0 for x in c)
+            return h_zone and h_tail and h_mult
+        pred_3_zone_dict = {k: v for k, v in triplet_counts.items() if is_sym_trend(k)}
+        pred_3_zone =[{"combo": list(k), "score": v} for k, v in Counter(pred_3_zone_dict).most_common(2)]
+
+        # 【3星】跳期規律：至少包含1個跳期號 + 至少1個熱門號
+        def is_skip_rule(c):
+            return any(x in skip_numbers for x in c) and any(x in hot_numbers for x in c)
+        pred_3_skip_dict = {k: v for k, v in triplet_counts.items() if is_skip_rule(k)}
+        pred_3_skip =[{"combo": list(k), "score": v} for k, v in Counter(pred_3_skip_dict).most_common(2)]
+
+        # 【3星】四區分散：分散在 1-20, 21-40, 41-60, 61-80 四個區塊中的三個
+        def is_scatter(c):
+            zones = set()
+            for x in c:
+                if 1<=x<=20: zones.add(1)
+                elif 21<=x<=40: zones.add(2)
+                elif 41<=x<=60: zones.add(3)
+                else: zones.add(4)
+            return len(zones) == 3 # 必須分佈在三個不同的區塊以分散風險
+        pred_3_scatter_dict = {k: v for k, v in triplet_counts.items() if is_scatter(k)}
+        pred_3_scatter =[{"combo": list(k), "score": v} for k, v in Counter(pred_3_scatter_dict).most_common(2)]
 
         tz_tw = timezone(timedelta(hours=8))
         return {
-            "total_draws": len(self.draws),
-            "last_draw_no": self.draws[-1]['draw_no'] if self.draws else "無",
-            "hot_numbers": hot_numbers[:8],
-            "cold_numbers": cold_numbers[:8],
-            "neighbors": neighbors[:8],
-            "recommendations": recs,
+            "last_draw_no": recent_draws[-1]['draw_no'] if recent_draws else "無",
+            "hot_numbers": hot_numbers[:10],
+            "cold_numbers": cold_numbers[:10],
+            "skip_numbers": skip_numbers[:10],
+            "hot_tails": hot_tails,
+            "pred_2_repeat": pred_2_repeat,
+            "pred_2_adjacent": pred_2_adjacent,
+            "pred_2_coldhot": pred_2_coldhot,
+            "pred_3_zone": pred_3_zone,
+            "pred_3_skip": pred_3_skip,
+            "pred_3_scatter": pred_3_scatter,
             "update_time": datetime.now(tz_tw).strftime("%H:%M:%S")
         }
 
-bingo_bot = BingoAnalyzer()
+bot = UltimateBingoPredictor()
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
-    data = bingo_bot.analyze()
+    data = bot.analyze()
     return templates.TemplateResponse("index.html", {"request": request, "data": data})
 
-# 確保 Zeabur 絕對抓得到 Port
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
